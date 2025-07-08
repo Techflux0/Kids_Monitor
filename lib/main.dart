@@ -1,14 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
-import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
-import 'dart:io';
+import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  if (Platform.isAndroid) {
-    AndroidWebViewController.enableDebugging(true);
-  }
   runApp(const MyApp());
 }
 
@@ -18,6 +13,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      debugShowCheckedModeBanner: false,
       title: 'DopeBox',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF0061FF)),
@@ -46,22 +42,27 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _isConnected = true;
   bool _isLoading = true;
   bool _hasError = false;
+  double _loadingProgress = 0;
+  final CacheManager _cacheManager = CacheManager(
+    Config(
+      'dopebox_cache',
+      stalePeriod: const Duration(days: 1),
+      maxNrOfCacheObjects: 100,
+    ),
+  );
 
-  @override
   @override
   void initState() {
     super.initState();
     _initializeWebView();
     _checkConnectivity();
-    Connectivity().onConnectivityChanged.listen((results) {
+    Connectivity().onConnectivityChanged.listen((
+      List<ConnectivityResult> results,
+    ) {
       final result = results.isNotEmpty
           ? results.first
           : ConnectivityResult.none;
       _handleConnectivityChange(result);
-    });
-
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted) _fixImageLoading();
     });
   }
 
@@ -72,7 +73,9 @@ class _MyHomePageState extends State<MyHomePage> {
       ..setNavigationDelegate(
         NavigationDelegate(
           onProgress: (int progress) {
-            setState(() => _isLoading = progress < 100);
+            setState(() {
+              _loadingProgress = progress / 100;
+            });
           },
           onPageStarted: (String url) {
             setState(() {
@@ -80,10 +83,25 @@ class _MyHomePageState extends State<MyHomePage> {
               _hasError = false;
             });
           },
-          onPageFinished: (String url) async {
-            setState(() => _isLoading = false);
-            await Future.delayed(const Duration(seconds: 1));
-            await _fixImageLoading();
+          onPageFinished: (String url) {
+            setState(() {
+              _isLoading = false;
+            });
+
+            _webViewController.runJavaScript('''
+              document.querySelectorAll('img').forEach(img => {
+                if (img.loading === 'lazy') {
+                  img.loading = 'eager';
+                }
+                if (!img.src && img.dataset.src) {
+                  img.src = img.dataset.src;
+                }
+              });
+              
+              const style = document.createElement('style');
+              style.innerHTML = 'img { opacity: 1 !important; }';
+              document.head.appendChild(style);
+            ''');
           },
           onWebResourceError: (WebResourceError error) {
             setState(() {
@@ -95,140 +113,39 @@ class _MyHomePageState extends State<MyHomePage> {
       )
       ..loadRequest(
         Uri.parse('https://dopebox.to/movie'),
-        headers: {
-          'User-Agent':
-              'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36',
-          'Referer': 'https://dopebox.to/',
-        },
+        headers: _getCacheHeaders(),
       );
   }
 
-  Future<void> _fixImageLoading() async {
-    await _webViewController.runJavaScript('''
-      // Enhanced image loader with MutationObserver
-      (function() {
-        const loadImage = (img) => {
-          if (img.dataset.processed) return;
-          img.dataset.processed = 'true';
-          
-          const sources = [
-            'data-src', 
-            'data-original', 
-            'data-lazy-src',
-            'data-srcset',
-            'data-lazy-srcset'
-          ];
-          
-          // Check for source attributes
-          for (const src of sources) {
-            if (img.hasAttribute(src)) {
-              const value = img.getAttribute(src);
-              if (src.includes('srcset')) {
-                img.srcset = value;
-              } else {
-                img.src = value;
-              }
-              break;
-            }
-          }
-          
-          // Handle picture/source elements
-          if (img.parentElement.tagName === 'PICTURE') {
-            const sources = img.parentElement.querySelectorAll('source');
-            sources.forEach(source => {
-              for (const src of sources) {
-                if (source.hasAttribute(src)) {
-                  const value = source.getAttribute(src);
-                  if (src.includes('srcset')) {
-                    source.srcset = value;
-                  } else {
-                    source.src = value;
-                  }
-                }
-              }
-            });
-          }
-          
-          // Remove lazy loading attributes
-          img.removeAttribute('loading');
-          img.removeAttribute('lazy');
-          
-        };
-
-        const processImages = () => {
-          const images = document.querySelectorAll('img:not([data-processed])');
-          images.forEach(img => {
-            loadImage(img);
-            img.onerror = () => {
-              img.style.display = 'none';
-              if (img.parentElement) {
-                img.parentElement.innerHTML = 
-                  '<div style="min-height:150px;display:flex;align-items:center;justify-content:center;color:#888">Image unavailable</div>';
-              }
-            };
-          });
-        };
-
-        // Process existing images
-        processImages();
-
-        // Set up MutationObserver for dynamically added content
-        const observer = new MutationObserver((mutations) => {
-          mutations.forEach(mutation => {
-            if (mutation.addedNodes.length) {
-              processImages();
-            }
-          });
-        });
-
-        observer.observe(document.body, {
-          childList: true,
-          subtree: true
-        });
-      })();
-    ''');
+  Map<String, String> _getCacheHeaders() {
+    return {'Cache-Control': 'max-age=3600', 'Pragma': 'cache'};
   }
 
   Future<void> _handleConnectivityChange(ConnectivityResult result) async {
     final isConnected = result != ConnectivityResult.none;
-    setState(() => _isConnected = isConnected);
-    if (isConnected && _hasError) await _webViewController.reload();
+    setState(() {
+      _isConnected = isConnected;
+    });
+
+    if (isConnected && _hasError) {
+      await _webViewController.reload();
+    }
   }
 
   Future<void> _checkConnectivity() async {
     final connectivityResult = await Connectivity().checkConnectivity();
-    setState(
-      () => _isConnected = connectivityResult != ConnectivityResult.none,
-    );
+    setState(() {
+      _isConnected = connectivityResult != ConnectivityResult.none;
+    });
   }
 
-  Widget _buildNoInternetView() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.wifi_off, size: 64, color: Colors.red),
-          const SizedBox(height: 20),
-          const Text(
-            'No Internet Connection',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 20),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF0061FF),
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-            ),
-            onPressed: () {
-              _checkConnectivity();
-              if (_isConnected) _webViewController.reload();
-            },
-            child: const Text('Retry Connection'),
-          ),
-        ],
-      ),
-    );
+  Future<void> _clearCacheAndReload() async {
+    await _cacheManager.emptyCache();
+    setState(() {
+      _hasError = false;
+      _isLoading = true;
+    });
+    await _webViewController.reload();
   }
 
   Widget _buildErrorView() {
@@ -239,18 +156,32 @@ class _MyHomePageState extends State<MyHomePage> {
           const Icon(Icons.error_outline, size: 64, color: Colors.red),
           const SizedBox(height: 20),
           const Text(
-            'Failed to Load Content',
+            'Unable to Load Content',
             style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
           ),
+          const SizedBox(height: 10),
+          const Text(
+            'The page could not be loaded. Please try again later.',
+            textAlign: TextAlign.center,
+          ),
           const SizedBox(height: 20),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF0061FF),
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-            ),
-            onPressed: () => _webViewController.reload(),
-            child: const Text('Try Again'),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF0061FF),
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: () => _webViewController.reload(),
+                child: const Text('Retry'),
+              ),
+              const SizedBox(width: 16),
+              TextButton(
+                onPressed: _clearCacheAndReload,
+                child: const Text('Clear Cache'),
+              ),
+            ],
           ),
         ],
       ),
@@ -271,12 +202,13 @@ class _MyHomePageState extends State<MyHomePage> {
         ),
         actions: [
           if (_isLoading)
-            const Padding(
-              padding: EdgeInsets.only(right: 16.0),
+            Padding(
+              padding: const EdgeInsets.only(right: 16.0),
               child: SizedBox(
                 width: 24,
                 height: 24,
                 child: CircularProgressIndicator(
+                  value: _loadingProgress,
                   strokeWidth: 2,
                   color: Colors.white,
                 ),
@@ -284,23 +216,59 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
         ],
       ),
-      body: !_isConnected
-          ? _buildNoInternetView()
-          : _hasError
-          ? _buildErrorView()
-          : Stack(
-              children: [
-                WebViewWidget(controller: _webViewController),
-                if (_isLoading)
-                  const Center(
-                    child: CircularProgressIndicator(
-                      valueColor: AlwaysStoppedAnimation<Color>(
-                        Color(0xFF0061FF),
-                      ),
+      body: Builder(
+        builder: (context) {
+          if (!_isConnected) {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.wifi_off, size: 64, color: Colors.red),
+                  const SizedBox(height: 20),
+                  const Text(
+                    'No Internet Connection',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 10),
+                  const Text(
+                    'Please check your connection and try again',
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 20),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF0061FF),
+                      foregroundColor: Colors.white,
+                    ),
+                    onPressed: () {
+                      _checkConnectivity();
+                      if (_isConnected) {
+                        _webViewController.reload();
+                      }
+                    },
+                    child: const Text('Retry'),
+                  ),
+                ],
+              ),
+            );
+          } else if (_hasError) {
+            return _buildErrorView();
+          }
+          return Stack(
+            children: [
+              WebViewWidget(controller: _webViewController),
+              if (_isLoading)
+                const Center(
+                  child: CircularProgressIndicator(
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      Color(0xFF0061FF),
                     ),
                   ),
-              ],
-            ),
+                ),
+            ],
+          );
+        },
+      ),
     );
   }
 }
